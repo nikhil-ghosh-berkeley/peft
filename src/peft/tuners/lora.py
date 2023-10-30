@@ -92,6 +92,9 @@ class LoraConfig(PeftConfig):
         default=True,
         metadata={"help": "Whether to initialize the weights of the Lora layers."},
     )
+    use_original_init: bool = field(
+        default=False, metadata={"help": "Whether to use the original Lora initialization or custom"}
+    )
     layers_to_transform: Optional[Union[List, int]] = field(
         default=None,
         metadata={
@@ -230,6 +233,7 @@ class LoraModel(torch.nn.Module):
             "lora_dropout": lora_config.lora_dropout,
             "fan_in_fan_out": lora_config.fan_in_fan_out,
             "init_lora_weights": lora_config.init_lora_weights,
+            "use_original_init": lora_config.use_original_init,
         }
         loaded_in_4bit = getattr(self.model, "is_loaded_in_4bit", False)
         loaded_in_8bit = getattr(self.model, "is_loaded_in_8bit", False)
@@ -316,6 +320,7 @@ class LoraModel(torch.nn.Module):
                     lora_config.lora_alpha,
                     lora_config.lora_dropout,
                     lora_config.init_lora_weights,
+                    lora_config.use_original_init,
                 )
             elif isinstance(target, LoraLayer):
                 target.update_layer(
@@ -324,6 +329,7 @@ class LoraModel(torch.nn.Module):
                     lora_config.lora_alpha,
                     lora_config.lora_dropout,
                     lora_config.init_lora_weights,
+                    lora_config.use_original_init,
                 )
             else:
                 new_module = self._create_new_module(lora_config, adapter_name, target)
@@ -530,7 +536,7 @@ class LoraLayer:
         self.out_features = out_features
         self.kwargs = kwargs
 
-    def update_layer(self, adapter_name, r, lora_alpha, lora_dropout, init_lora_weights):
+    def update_layer(self, adapter_name, r, lora_alpha, lora_dropout, init_lora_weights, use_original_init):
         self.r[adapter_name] = r
         self.lora_alpha[adapter_name] = lora_alpha
         if lora_dropout > 0.0:
@@ -545,10 +551,10 @@ class LoraLayer:
             self.lora_B.update(nn.ModuleDict({adapter_name: nn.Linear(r, self.out_features, bias=False)}))
             self.scaling[adapter_name] = lora_alpha / r
         if init_lora_weights:
-            self.reset_lora_parameters(adapter_name)
+            self.reset_lora_parameters(adapter_name, use_original_init)
         self.to(self.weight.device)
 
-    def update_layer_conv2d(self, adapter_name, r, lora_alpha, lora_dropout, init_lora_weights):
+    def update_layer_conv2d(self, adapter_name, r, lora_alpha, lora_dropout, init_lora_weights, use_original_init):
         self.r[adapter_name] = r
         self.lora_alpha[adapter_name] = lora_alpha
         if lora_dropout > 0.0:
@@ -570,10 +576,10 @@ class LoraLayer:
             )
             self.scaling[adapter_name] = lora_alpha / r
         if init_lora_weights:
-            self.reset_lora_parameters(adapter_name)
+            self.reset_lora_parameters(adapter_name, use_original_init)
         self.to(self.weight.device)
 
-    def update_layer_embedding(self, adapter_name, r, lora_alpha, lora_dropout, init_lora_weights):
+    def update_layer_embedding(self, adapter_name, r, lora_alpha, lora_dropout, init_lora_weights, use_original_init):
         self.r[adapter_name] = r
         self.lora_alpha[adapter_name] = lora_alpha
         if lora_dropout > 0.0:
@@ -592,22 +598,27 @@ class LoraLayer:
             )
             self.scaling[adapter_name] = lora_alpha / r
         if init_lora_weights:
-            self.reset_lora_parameters(adapter_name)
+            self.reset_lora_parameters(adapter_name, use_original_init)
         self.to(self.weight.device)
 
-    def reset_lora_parameters(self, adapter_name):
+    def reset_lora_parameters(self, adapter_name, use_original_init):
         if adapter_name in self.lora_A.keys():
             # initialize A the same way as the default for nn.Linear and B to zero
-            # nn.init.kaiming_uniform_(self.lora_A[adapter_name].weight, a=math.sqrt(5))
-            # nn.init.zeros_(self.lora_B[adapter_name].weight)
-            nn.init.kaiming_uniform_(self.lora_B[adapter_name].weight, a=math.sqrt(5))
-            nn.init.zeros_(self.lora_A[adapter_name].weight)
+            if use_original_init:
+                nn.init.kaiming_uniform_(self.lora_A[adapter_name].weight, a=math.sqrt(5))
+                nn.init.zeros_(self.lora_B[adapter_name].weight)
+            else:
+                nn.init.kaiming_uniform_(self.lora_B[adapter_name].weight, a=math.sqrt(5))
+                nn.init.zeros_(self.lora_A[adapter_name].weight)
         if adapter_name in self.lora_embedding_A.keys():
             # initialize a the same way as the default for nn.linear and b to zero
-            # nn.init.zeros_(self.lora_embedding_A[adapter_name])
-            # nn.init.normal_(self.lora_embedding_B[adapter_name])
-            nn.init.zeros_(self.lora_embedding_B[adapter_name])
-            nn.init.normal_(self.lora_embedding_A[adapter_name])
+            if use_original_init:
+                nn.init.zeros_(self.lora_embedding_A[adapter_name])
+                nn.init.normal_(self.lora_embedding_B[adapter_name])
+            else:
+                nn.init.zeros_(self.lora_embedding_B[adapter_name])
+                nn.init.normal_(self.lora_embedding_A[adapter_name])
+
 
 class Linear(nn.Linear, LoraLayer):
     # Lora implemented in a dense layer
@@ -623,6 +634,7 @@ class Linear(nn.Linear, LoraLayer):
         **kwargs,
     ):
         init_lora_weights = kwargs.pop("init_lora_weights", True)
+        use_original_init = kwargs.pop("use_original_init", False)
 
         nn.Linear.__init__(self, in_features, out_features, **kwargs)
         LoraLayer.__init__(self, in_features=in_features, out_features=out_features)
@@ -634,7 +646,7 @@ class Linear(nn.Linear, LoraLayer):
             self.weight.data = self.weight.data.T
 
         nn.Linear.reset_parameters(self)
-        self.update_layer(adapter_name, r, lora_alpha, lora_dropout, init_lora_weights)
+        self.update_layer(adapter_name, r, lora_alpha, lora_dropout, init_lora_weights, use_original_init)
         self.active_adapter = adapter_name
 
     def merge(self):
@@ -709,6 +721,7 @@ class Embedding(nn.Embedding, LoraLayer):
         **kwargs,
     ):
         init_lora_weights = kwargs.pop("init_lora_weights", True)
+        use_original_init = kwargs.pop("use_original_init", False)
 
         nn.Embedding.__init__(self, num_embeddings, embedding_dim, **kwargs)
         LoraLayer.__init__(self, in_features=num_embeddings, out_features=embedding_dim)
@@ -716,7 +729,7 @@ class Embedding(nn.Embedding, LoraLayer):
         self.weight.requires_grad = False
 
         nn.Embedding.reset_parameters(self)
-        self.update_layer_embedding(adapter_name, r, lora_alpha, lora_dropout, init_lora_weights)
+        self.update_layer_embedding(adapter_name, r, lora_alpha, lora_dropout, init_lora_weights, use_original_init)
         self.active_adapter = adapter_name
 
     def unmerge(self, mode: bool = True):
@@ -793,6 +806,7 @@ class Conv2d(nn.Conv2d, LoraLayer):
         **kwargs,
     ):
         init_lora_weights = kwargs.pop("init_lora_weights", True)
+        use_original_init = kwargs.pop("use_original_init", False)
 
         nn.Conv2d.__init__(self, in_channels, out_channels, kernel_size, stride, padding)
         LoraLayer.__init__(
@@ -807,7 +821,7 @@ class Conv2d(nn.Conv2d, LoraLayer):
         self.weight.requires_grad = False
 
         nn.Conv2d.reset_parameters(self)
-        self.update_layer_conv2d(adapter_name, r, lora_alpha, lora_dropout, init_lora_weights)
+        self.update_layer_conv2d(adapter_name, r, lora_alpha, lora_dropout, init_lora_weights, use_original_init)
         self.active_adapter = adapter_name
 
     def merge(self):
@@ -948,7 +962,9 @@ if is_bnb_available():
             # Freezing the pre-trained weight matrix
             self.weight.requires_grad = False
             init_lora_weights = kwargs.pop("init_lora_weights", True)
-            self.update_layer(adapter_name, r, lora_alpha, lora_dropout, init_lora_weights)
+            use_original_init = kwargs.pop("use_original_init", False)
+
+            self.update_layer(adapter_name, r, lora_alpha, lora_dropout, init_lora_weights, use_original_init)
             self.active_adapter = adapter_name
 
         def forward(self, x: torch.Tensor):
@@ -1007,7 +1023,9 @@ if is_bnb_available():
                 self.weight.requires_grad = False
 
                 init_lora_weights = kwargs.pop("init_lora_weights", True)
-                self.update_layer(adapter_name, r, lora_alpha, lora_dropout, init_lora_weights)
+                use_original_init = kwargs.pop("use_original_init", False)
+
+                self.update_layer(adapter_name, r, lora_alpha, lora_dropout, init_lora_weights, use_original_init)
                 self.active_adapter = adapter_name
 
             def forward(self, x: torch.Tensor):
