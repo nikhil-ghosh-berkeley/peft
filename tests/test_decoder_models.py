@@ -13,10 +13,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import unittest
+from unittest.mock import Mock, call, patch
 
 import torch
 from parameterized import parameterized
-from transformers import AutoModelForCausalLM
+from transformers import AutoModelForCausalLM, AutoTokenizer
+
+from peft import AdaLoraConfig, PromptTuningConfig, PromptTuningInit, get_peft_model
 
 from .testing_common import PeftCommonTester, PeftTestConfigManager
 
@@ -38,11 +41,8 @@ FULL_GRID = {
 }
 
 
-def skip_non_pt_mqa(test_list):
-    r"""
-    Skip tests that are prefix tuning for MQA models (not supported yet)
-    """
-    return [test for test in test_list if not ("prefix_tuning" in test[0] and "GPTBigCodeForCausalLM" in test[0])]
+def skip_adalora_and_gpt2(test_list):
+    return [test for test in test_list if not (("GPT2LMHeadModel" in test[1]) and (test[2] == AdaLoraConfig))]
 
 
 class PeftDecoderModelTester(unittest.TestCase, PeftCommonTester):
@@ -78,8 +78,75 @@ class PeftDecoderModelTester(unittest.TestCase, PeftCommonTester):
         self._test_prepare_for_training(model_id, config_cls, config_kwargs)
 
     @parameterized.expand(PeftTestConfigManager.get_grid_parameters(FULL_GRID))
+    def test_prompt_tuning_text_prepare_for_training(self, test_name, model_id, config_cls, config_kwargs):
+        # Test that prompt tuning works with text init
+        if config_cls != PromptTuningConfig:
+            return
+
+        config_kwargs = config_kwargs.copy()
+        config_kwargs["prompt_tuning_init"] = PromptTuningInit.TEXT
+        config_kwargs["prompt_tuning_init_text"] = "This is a test prompt."
+        config_kwargs["tokenizer_name_or_path"] = model_id
+        self._test_prepare_for_training(model_id, config_cls, config_kwargs)
+
+    def test_prompt_tuning_text_tokenizer_kwargs(self):
+        # Allow users to pass additional arguments to Tokenizer.from_pretrained
+        # Fix for #1032
+        mock = Mock()
+        orig_from_pretrained = AutoTokenizer.from_pretrained
+
+        def mock_autotokenizer_from_pretrained(*args, **kwargs):
+            mock(*args, **kwargs)
+            return orig_from_pretrained(config.tokenizer_name_or_path)
+
+        model_id = "hf-internal-testing/tiny-random-OPTForCausalLM"
+        config = PromptTuningConfig(
+            base_model_name_or_path=model_id,
+            tokenizer_name_or_path=model_id,
+            num_virtual_tokens=10,
+            prompt_tuning_init=PromptTuningInit.TEXT,
+            task_type="CAUSAL_LM",
+            prompt_tuning_init_text="This is a test prompt.",
+            tokenizer_kwargs={"trust_remote_code": True, "foo": "bar"},
+        )
+        model = self.transformers_class.from_pretrained(model_id).to(self.torch_device)
+        with patch("transformers.AutoTokenizer.from_pretrained", mock_autotokenizer_from_pretrained):
+            model = get_peft_model(model, config)
+
+        expected_call = call(model_id, trust_remote_code=True, foo="bar")
+        self.assertEqual(mock.call_args, expected_call)
+
+    def test_prompt_tuning_config_invalid_args(self):
+        # Raise an error when tokenizer_kwargs is used with prompt_tuning_init!='TEXT', because this argument has no
+        # function in that case
+        model_id = "hf-internal-testing/tiny-random-OPTForCausalLM"
+        msg = "tokenizer_kwargs only valid when using prompt_tuning_init='TEXT'."
+        with self.assertRaisesRegex(ValueError, expected_regex=msg):
+            PromptTuningConfig(
+                base_model_name_or_path=model_id,
+                tokenizer_name_or_path=model_id,
+                num_virtual_tokens=10,
+                task_type="CAUSAL_LM",
+                prompt_tuning_init_text="This is a test prompt.",
+                prompt_tuning_init=PromptTuningInit.RANDOM,  # <= should not be used together with tokenizer_kwargs
+                tokenizer_kwargs={"trust_remote_code": True, "foo": "bar"},
+            )
+
+    @parameterized.expand(PeftTestConfigManager.get_grid_parameters(FULL_GRID))
     def test_save_pretrained(self, test_name, model_id, config_cls, config_kwargs):
         self._test_save_pretrained(model_id, config_cls, config_kwargs)
+
+    @parameterized.expand(PeftTestConfigManager.get_grid_parameters(FULL_GRID))
+    def test_save_pretrained_pickle(self, test_name, model_id, config_cls, config_kwargs):
+        self._test_save_pretrained(model_id, config_cls, config_kwargs, safe_serialization=False)
+
+    @parameterized.expand(PeftTestConfigManager.get_grid_parameters(FULL_GRID))
+    def test_save_pretrained_selected_adapters(self, test_name, model_id, config_cls, config_kwargs):
+        self._test_save_pretrained_selected_adapters(model_id, config_cls, config_kwargs)
+
+    @parameterized.expand(PeftTestConfigManager.get_grid_parameters(FULL_GRID))
+    def test_save_pretrained_selected_adapters_pickle(self, test_name, model_id, config_cls, config_kwargs):
+        self._test_save_pretrained_selected_adapters(model_id, config_cls, config_kwargs, safe_serialization=False)
 
     @parameterized.expand(PeftTestConfigManager.get_grid_parameters(FULL_GRID))
     def test_from_pretrained_config_construction(self, test_name, model_id, config_cls, config_kwargs):
@@ -90,6 +157,7 @@ class PeftDecoderModelTester(unittest.TestCase, PeftCommonTester):
             {
                 "model_ids": PEFT_DECODER_MODELS_TO_TEST,
                 "lora_kwargs": {"init_lora_weights": [False]},
+                "ia3_kwargs": {"init_ia3_weights": [False]},
                 "task_type": "CAUSAL_LM",
             },
         )
@@ -97,13 +165,47 @@ class PeftDecoderModelTester(unittest.TestCase, PeftCommonTester):
     def test_merge_layers(self, test_name, model_id, config_cls, config_kwargs):
         self._test_merge_layers(model_id, config_cls, config_kwargs)
 
-    @parameterized.expand(PeftTestConfigManager.get_grid_parameters(FULL_GRID, filter_params_func=skip_non_pt_mqa))
+    @parameterized.expand(
+        PeftTestConfigManager.get_grid_parameters(
+            {
+                "model_ids": PEFT_DECODER_MODELS_TO_TEST,
+                "lora_kwargs": {"init_lora_weights": [False]},
+                "ia3_kwargs": {"init_ia3_weights": [False]},
+                "task_type": "CAUSAL_LM",
+            },
+        )
+    )
+    def test_merge_layers_multi(self, test_name, model_id, config_cls, config_kwargs):
+        self._test_merge_layers_multi(model_id, config_cls, config_kwargs)
+
+    @parameterized.expand(
+        PeftTestConfigManager.get_grid_parameters(
+            {
+                "model_ids": PEFT_DECODER_MODELS_TO_TEST,
+                "lora_kwargs": {"init_lora_weights": [False]},
+                "ia3_kwargs": {"init_ia3_weights": [False]},
+                "task_type": "CAUSAL_LM",
+            },
+        )
+    )
+    def test_merge_layers_nan(self, test_name, model_id, config_cls, config_kwargs):
+        self._test_merge_layers_nan(model_id, config_cls, config_kwargs)
+
+    @parameterized.expand(PeftTestConfigManager.get_grid_parameters(FULL_GRID))
     def test_generate(self, test_name, model_id, config_cls, config_kwargs):
         self._test_generate(model_id, config_cls, config_kwargs)
 
-    @parameterized.expand(PeftTestConfigManager.get_grid_parameters(FULL_GRID, filter_params_func=skip_non_pt_mqa))
+    @parameterized.expand(PeftTestConfigManager.get_grid_parameters(FULL_GRID))
+    def test_merge_layers_fp16(self, test_name, model_id, config_cls, config_kwargs):
+        self._test_merge_layers_fp16(model_id, config_cls, config_kwargs)
+
+    @parameterized.expand(PeftTestConfigManager.get_grid_parameters(FULL_GRID))
     def test_generate_half_prec(self, test_name, model_id, config_cls, config_kwargs):
         self._test_generate_half_prec(model_id, config_cls, config_kwargs)
+
+    @parameterized.expand(PeftTestConfigManager.get_grid_parameters(FULL_GRID))
+    def test_prefix_tuning_half_prec_conversion(self, test_name, model_id, config_cls, config_kwargs):
+        self._test_prefix_tuning_half_prec_conversion(model_id, config_cls, config_kwargs)
 
     @parameterized.expand(PeftTestConfigManager.get_grid_parameters(FULL_GRID))
     def test_training_decoders(self, test_name, model_id, config_cls, config_kwargs):
@@ -124,3 +226,74 @@ class PeftDecoderModelTester(unittest.TestCase, PeftCommonTester):
     @parameterized.expand(PeftTestConfigManager.get_grid_parameters(FULL_GRID))
     def test_peft_model_device_map(self, test_name, model_id, config_cls, config_kwargs):
         self._test_peft_model_device_map(model_id, config_cls, config_kwargs)
+
+    @parameterized.expand(PeftTestConfigManager.get_grid_parameters(FULL_GRID))
+    def test_delete_adapter(self, test_name, model_id, config_cls, config_kwargs):
+        self._test_delete_adapter(model_id, config_cls, config_kwargs)
+
+    @parameterized.expand(PeftTestConfigManager.get_grid_parameters(FULL_GRID))
+    def test_delete_inactive_adapter(self, test_name, model_id, config_cls, config_kwargs):
+        self._test_delete_inactive_adapter(model_id, config_cls, config_kwargs)
+
+    @parameterized.expand(PeftTestConfigManager.get_grid_parameters(FULL_GRID))
+    def test_adding_multiple_adapters_with_bias_raises(self, test_name, model_id, config_cls, config_kwargs):
+        self._test_adding_multiple_adapters_with_bias_raises(model_id, config_cls, config_kwargs)
+
+    @parameterized.expand(
+        PeftTestConfigManager.get_grid_parameters(
+            {
+                "model_ids": PEFT_DECODER_MODELS_TO_TEST,
+                "lora_kwargs": {"init_lora_weights": [False]},
+                "adalora_kwargs": {"init_lora_weights": [False]},
+                "ia3_kwargs": {"init_ia3_weights": [False]},
+                "task_type": "CAUSAL_LM",
+            },
+            filter_params_func=skip_adalora_and_gpt2,
+        )
+    )
+    def test_unload_adapter(self, test_name, model_id, config_cls, config_kwargs):
+        self._test_unload_adapter(model_id, config_cls, config_kwargs)
+
+    @parameterized.expand(
+        PeftTestConfigManager.get_grid_parameters(
+            {
+                "model_ids": PEFT_DECODER_MODELS_TO_TEST,
+                "lora_kwargs": {"init_lora_weights": [False]},
+                "task_type": "CAUSAL_LM",
+            },
+        )
+    )
+    def test_weighted_combination_of_adapters(self, test_name, model_id, config_cls, config_kwargs):
+        self._test_weighted_combination_of_adapters(model_id, config_cls, config_kwargs)
+
+    @parameterized.expand(PeftTestConfigManager.get_grid_parameters(FULL_GRID))
+    def test_training_prompt_learning_tasks(self, test_name, model_id, config_cls, config_kwargs):
+        self._test_training_prompt_learning_tasks(model_id, config_cls, config_kwargs)
+
+    @parameterized.expand(
+        PeftTestConfigManager.get_grid_parameters(
+            {
+                "model_ids": PEFT_DECODER_MODELS_TO_TEST,
+                "lora_kwargs": {"init_lora_weights": [False]},
+                "ia3_kwargs": {"init_ia3_weights": [False]},
+                "adalora_kwargs": {"init_lora_weights": [False]},
+                "task_type": "CAUSAL_LM",
+            },
+        )
+    )
+    def test_disable_adapter(self, test_name, model_id, config_cls, config_kwargs):
+        self._test_disable_adapter(model_id, config_cls, config_kwargs)
+
+    def test_generate_adalora_no_dropout(self):
+        # test for issue #730
+        model_id = "hf-internal-testing/tiny-random-OPTForCausalLM"
+        config_kwargs = {
+            "target_modules": None,
+            "task_type": "CAUSAL_LM",
+            "lora_dropout": 0.0,
+        }
+        self._test_generate(model_id, AdaLoraConfig, config_kwargs)
+
+    @parameterized.expand(PeftTestConfigManager.get_grid_parameters(FULL_GRID))
+    def test_passing_input_embeds_works(self, test_name, model_id, config_cls, config_kwargs):
+        self._test_passing_input_embeds_works(test_name, model_id, config_cls, config_kwargs)

@@ -12,11 +12,14 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import tempfile
 import unittest
 
 import torch
 from parameterized import parameterized
-from transformers import AutoModelForSeq2SeqLM
+from transformers import AutoModelForSeq2SeqLM, AutoModelForTokenClassification
+
+from peft import LoraConfig, TaskType, get_peft_model
 
 from .testing_common import PeftCommonTester, PeftTestConfigManager
 
@@ -27,13 +30,6 @@ PEFT_ENCODER_DECODER_MODELS_TO_TEST = [
 ]
 
 FULL_GRID = {"model_ids": PEFT_ENCODER_DECODER_MODELS_TO_TEST, "task_type": "SEQ_2_SEQ_LM"}
-
-
-def skip_non_lora_or_pt(test_list):
-    r"""
-    Skip tests that are not lora or prefix tuning
-    """
-    return [test for test in test_list if ("lora" in test[0] or "prefix_tuning" in test[0])]
 
 
 class PeftEncoderDecoderModelTester(unittest.TestCase, PeftCommonTester):
@@ -75,6 +71,18 @@ class PeftEncoderDecoderModelTester(unittest.TestCase, PeftCommonTester):
         self._test_save_pretrained(model_id, config_cls, config_kwargs)
 
     @parameterized.expand(PeftTestConfigManager.get_grid_parameters(FULL_GRID))
+    def test_save_pretrained_pickle(self, test_name, model_id, config_cls, config_kwargs):
+        self._test_save_pretrained(model_id, config_cls, config_kwargs, safe_serialization=False)
+
+    @parameterized.expand(PeftTestConfigManager.get_grid_parameters(FULL_GRID))
+    def test_save_pretrained_selected_adapters(self, test_name, model_id, config_cls, config_kwargs):
+        self._test_save_pretrained_selected_adapters(model_id, config_cls, config_kwargs)
+
+    @parameterized.expand(PeftTestConfigManager.get_grid_parameters(FULL_GRID))
+    def test_save_pretrained_selected_adapters_pickle(self, test_name, model_id, config_cls, config_kwargs):
+        self._test_save_pretrained_selected_adapters(model_id, config_cls, config_kwargs, safe_serialization=False)
+
+    @parameterized.expand(PeftTestConfigManager.get_grid_parameters(FULL_GRID))
     def test_from_pretrained_config_construction(self, test_name, model_id, config_cls, config_kwargs):
         self._test_from_pretrained_config_construction(model_id, config_cls, config_kwargs)
 
@@ -83,6 +91,7 @@ class PeftEncoderDecoderModelTester(unittest.TestCase, PeftCommonTester):
             {
                 "model_ids": PEFT_ENCODER_DECODER_MODELS_TO_TEST,
                 "lora_kwargs": {"init_lora_weights": [False]},
+                "ia3_kwargs": {"init_ia3_weights": [False]},
                 "task_type": "SEQ_2_SEQ_LM",
             },
         )
@@ -91,13 +100,17 @@ class PeftEncoderDecoderModelTester(unittest.TestCase, PeftCommonTester):
         self._test_merge_layers(model_id, config_cls, config_kwargs)
 
     # skip non lora models - generate does not work for prefix tuning, prompt tuning
-    @parameterized.expand(PeftTestConfigManager.get_grid_parameters(FULL_GRID, filter_params_func=skip_non_lora_or_pt))
+    @parameterized.expand(PeftTestConfigManager.get_grid_parameters(FULL_GRID))
     def test_generate(self, test_name, model_id, config_cls, config_kwargs):
         self._test_generate(model_id, config_cls, config_kwargs)
 
     @parameterized.expand(PeftTestConfigManager.get_grid_parameters(FULL_GRID))
     def test_generate_half_prec(self, test_name, model_id, config_cls, config_kwargs):
         self._test_generate_half_prec(model_id, config_cls, config_kwargs)
+
+    @parameterized.expand(PeftTestConfigManager.get_grid_parameters(FULL_GRID))
+    def test_prefix_tuning_half_prec_conversion(self, test_name, model_id, config_cls, config_kwargs):
+        self._test_prefix_tuning_half_prec_conversion(model_id, config_cls, config_kwargs)
 
     @parameterized.expand(PeftTestConfigManager.get_grid_parameters(FULL_GRID))
     def test_training_encoder_decoders(self, test_name, model_id, config_cls, config_kwargs):
@@ -118,3 +131,76 @@ class PeftEncoderDecoderModelTester(unittest.TestCase, PeftCommonTester):
     @parameterized.expand(PeftTestConfigManager.get_grid_parameters(FULL_GRID))
     def test_peft_model_device_map(self, test_name, model_id, config_cls, config_kwargs):
         self._test_peft_model_device_map(model_id, config_cls, config_kwargs)
+
+    @parameterized.expand(PeftTestConfigManager.get_grid_parameters(FULL_GRID))
+    def test_delete_adapter(self, test_name, model_id, config_cls, config_kwargs):
+        self._test_delete_adapter(model_id, config_cls, config_kwargs)
+
+    @parameterized.expand(PeftTestConfigManager.get_grid_parameters(FULL_GRID))
+    def test_delete_inactive_adapter(self, test_name, model_id, config_cls, config_kwargs):
+        self._test_delete_inactive_adapter(model_id, config_cls, config_kwargs)
+
+    @parameterized.expand(PeftTestConfigManager.get_grid_parameters(FULL_GRID))
+    def test_adding_multiple_adapters_with_bias_raises(self, test_name, model_id, config_cls, config_kwargs):
+        self._test_adding_multiple_adapters_with_bias_raises(model_id, config_cls, config_kwargs)
+
+    @parameterized.expand(
+        PeftTestConfigManager.get_grid_parameters(
+            {
+                "model_ids": PEFT_ENCODER_DECODER_MODELS_TO_TEST,
+                "lora_kwargs": {"init_lora_weights": [False]},
+                "adalora_kwargs": {"init_lora_weights": [False]},
+                "ia3_kwargs": {"init_ia3_weights": [False]},
+                "task_type": "SEQ_2_SEQ_LM",
+            },
+        )
+    )
+    def test_unload_adapter(self, test_name, model_id, config_cls, config_kwargs):
+        self._test_unload_adapter(model_id, config_cls, config_kwargs)
+
+    @parameterized.expand(
+        PeftTestConfigManager.get_grid_parameters(
+            {
+                "model_ids": PEFT_ENCODER_DECODER_MODELS_TO_TEST,
+                "lora_kwargs": {"init_lora_weights": [False]},
+                "task_type": "SEQ_2_SEQ_LM",
+            },
+        )
+    )
+    def test_weighted_combination_of_adapters(self, test_name, model_id, config_cls, config_kwargs):
+        self._test_weighted_combination_of_adapters(model_id, config_cls, config_kwargs)
+
+    @parameterized.expand(PeftTestConfigManager.get_grid_parameters(FULL_GRID))
+    def test_training_prompt_learning_tasks(self, test_name, model_id, config_cls, config_kwargs):
+        self._test_training_prompt_learning_tasks(model_id, config_cls, config_kwargs)
+
+    @parameterized.expand(
+        PeftTestConfigManager.get_grid_parameters(
+            {
+                "model_ids": PEFT_ENCODER_DECODER_MODELS_TO_TEST,
+                "lora_kwargs": {"init_lora_weights": [False]},
+                "adalora_kwargs": {"init_lora_weights": [False]},
+                "ia3_kwargs": {"init_ia3_weights": [False]},
+                "task_type": "SEQ_2_SEQ_LM",
+            },
+        )
+    )
+    def test_disable_adapter(self, test_name, model_id, config_cls, config_kwargs):
+        self._test_disable_adapter(model_id, config_cls, config_kwargs)
+
+
+class PeftEncoderDecoderCustomModelTester(unittest.TestCase):
+    """
+    A custom class to write any custom test related with Enc-Dec models
+    """
+
+    def test_save_shared_tensors(self):
+        model_id = "hf-internal-testing/tiny-random-RobertaModel"
+        peft_config = LoraConfig(
+            task_type=TaskType.TOKEN_CLS, inference_mode=False, r=16, lora_alpha=16, lora_dropout=0.1, bias="all"
+        )
+        model = AutoModelForTokenClassification.from_pretrained(model_id, num_labels=11)
+        model = get_peft_model(model, peft_config)
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            # This should work fine
+            model.save_pretrained(tmp_dir, safe_serialization=True)
