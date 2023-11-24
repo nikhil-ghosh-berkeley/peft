@@ -37,12 +37,13 @@ if is_bnb_available():
             lora_alpha: int = 1,
             lora_dropout: float = 0.0,
             init_lora_weights: bool = True,
+            use_original_init: bool = False,
             **kwargs,
         ) -> None:
             super().__init__()
             LoraLayer.__init__(self, base_layer)
 
-            self.update_layer(adapter_name, r, lora_alpha, lora_dropout, init_lora_weights)
+            self.update_layer(adapter_name, r, lora_alpha, lora_dropout, init_lora_weights, use_original_init)
 
         def merge(self, safe_merge: bool = False, adapter_names: Optional[List[str]] = None) -> None:
             """
@@ -191,12 +192,13 @@ if is_bnb_4bit_available():
             lora_alpha: int = 1,
             lora_dropout: float = 0.0,
             init_lora_weights: bool = True,
+            use_original_init: bool = False,
             **kwargs,
         ) -> None:
             super().__init__()
             LoraLayer.__init__(self, base_layer)
 
-            self.update_layer(adapter_name, r, lora_alpha, lora_dropout, init_lora_weights)
+            self.update_layer(adapter_name, r, lora_alpha, lora_dropout, init_lora_weights, use_original_init)
 
         def merge(self, safe_merge: bool = False, adapter_names: Optional[List[str]] = None) -> None:
             """
